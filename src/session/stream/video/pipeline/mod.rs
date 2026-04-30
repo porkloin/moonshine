@@ -29,6 +29,39 @@ use pixelforge::{
 	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
+/// Spawn a 1-Hz GPU stat sampler that writes into the telemetry gauges.
+/// Lives on a tokio task; ends when the session shutdown manager fires.
+/// No-op when no AMD card is found under `/sys/class/drm`.
+fn spawn_gpu_sampler(metrics: Arc<PipelineMetrics>, shutdown: ShutdownManager<SessionShutdownReason>) {
+	let Some(card_root) = crate::gpu_stats::auto_detect_amd_card() else {
+		tracing::debug!("GPU stat sampler: no AMD card found, telemetry gauges will stay at 0");
+		return;
+	};
+	let paths = crate::gpu_stats::CardPaths::from_card(&card_root);
+	tokio::spawn(async move {
+		let _delay = shutdown.delay_shutdown_token();
+		let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		let mut on_shutdown = std::pin::pin!(shutdown.wait_shutdown_triggered());
+		loop {
+			tokio::select! {
+				_ = interval.tick() => {
+					if let Some(mhz) = crate::gpu_stats::read_active_sclk_mhz(&paths.sclk) {
+						metrics.gpu_sclk_mhz.record(mhz as u64, &[]);
+					}
+					if let Some(pct) = crate::gpu_stats::read_busy_percent(&paths.busy) {
+						metrics.gpu_busy_pct.record(pct as u64, &[]);
+					}
+					if let Some(bytes) = crate::gpu_stats::read_vram_used_bytes(&paths.vram) {
+						metrics.vram_used_bytes.record(bytes, &[]);
+					}
+				}
+				_ = on_shutdown.as_mut() => break,
+			}
+		}
+	});
+}
+
 /// Label string for OTel metric attributes. Keeps cardinality low (one
 /// of three known values) so collectors don't have to deal with arbitrary
 /// strings.
@@ -230,6 +263,16 @@ impl VideoPipelineInner {
 		let _session_stop_token =
 			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoEncoderStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
+		// Spawn the GPU stat sampler if telemetry is enabled. Records
+		// sclk/busy/vram into the OTel gauges at 1 Hz so dashboards see
+		// real-time GPU state alongside per-frame latency. Sampler stops
+		// when the session shutdown token fires.
+		let gpu_sampler_stop = stop_session_manager.delay_shutdown_token();
+		if let Some(metrics) = self.metrics.clone() {
+			spawn_gpu_sampler(metrics, stop_session_manager.clone());
+		}
+		drop(gpu_sampler_stop);
 
 		// Create the encoder.
 		let (context, encoder) = match self.create_encoder() {

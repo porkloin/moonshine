@@ -182,17 +182,11 @@ pub struct PipelineMetrics {
 	pub stage_latency_us: Histogram<u64>,
 	pub total_latency_us: Histogram<u64>,
 	pub encoded_bytes: Histogram<u64>,
-	// GPU/VRAM gauges are recorded by a future production-side periodic
-	// sampler (the bench's GPU stat reader at `bench::auto_detect_amd_card`
-	// + `read_active_sclk_mhz` + `read_busy_percent` is the natural source
-	// to extract into a shared module). For now these instruments exist
-	// so dashboards using them don't 404 once the sampler lands; they're
-	// wired but unused until then.
-	#[allow(dead_code)]
+	// Sampled at 1 Hz by `pipeline::spawn_gpu_sampler` whenever telemetry
+	// is enabled. AMD-only — no-op when no AMD card is found under
+	// `/sys/class/drm`.
 	pub gpu_sclk_mhz: Gauge<u64>,
-	#[allow(dead_code)]
 	pub gpu_busy_pct: Gauge<u64>,
-	#[allow(dead_code)]
 	pub vram_used_bytes: Gauge<u64>,
 	pub dmabuf_cache_size: Gauge<u64>,
 }

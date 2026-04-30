@@ -11,15 +11,13 @@ use crate::webserver::Webserver;
 use async_shutdown::ShutdownManager;
 use clap::{Parser, Subcommand};
 use tokio::signal::unix::{signal, SignalKind};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 mod app_scanner;
 mod bench;
 mod clients;
 mod config;
 mod crypto;
+mod gpu_stats;
 mod publisher;
 mod rtsp;
 mod session;
