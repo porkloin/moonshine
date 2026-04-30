@@ -182,21 +182,24 @@ fn build_resource(service_name: &str) -> Resource {
 /// stdout `tracing-subscriber` (so logs work) but skips all OTel pipeline
 /// init.
 pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard, String> {
-	// Snapshot the trace mode for the rest of the process to read.
-	// `set` only succeeds the first time; treat re-init as a no-op.
-	let _ = TRACE_MODE.set(cfg.trace_mode);
-
 	let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 	let fmt_layer = tracing_subscriber::fmt::layer();
 
 	let Some(endpoint) = &cfg.otlp_endpoint else {
-		// Telemetry off — install only the stdout layer.
+		// Telemetry off — install only the stdout layer. Force TRACE_MODE
+		// to None regardless of what the user asked for, so the pipeline
+		// hot path's spike-span branch is dead code (no allocations,
+		// no fmt-layer ghost spans going nowhere useful).
+		let _ = TRACE_MODE.set(TraceMode::None);
 		tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
 		return Ok(TelemetryGuard {
 			tracer_provider: None,
 			meter_provider: None,
 		});
 	};
+
+	// Endpoint is set — record the user's chosen mode for the pipeline.
+	let _ = TRACE_MODE.set(cfg.trace_mode);
 
 	let service_name = cfg.service_name.clone().unwrap_or_else(|| "moonshine".to_string());
 	let resource = build_resource(&service_name);
