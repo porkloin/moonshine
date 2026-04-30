@@ -38,8 +38,25 @@ struct Args {
 	#[arg(long, global = true)]
 	otlp_endpoint: Option<String>,
 
+	/// Override per-frame trace emission mode: `none`, `outliers`, or
+	/// `static`. Use with `--trace-sample-rate` for `static`.
+	#[arg(long, global = true, value_parser = parse_trace_mode_cli)]
+	trace_mode: Option<String>,
+
+	/// Static-mode trace sampling rate (0.0–1.0). Only consulted when
+	/// `--trace-mode static`.
+	#[arg(long, global = true)]
+	trace_sample_rate: Option<f64>,
+
 	#[command(subcommand)]
 	command: Option<Command>,
+}
+
+fn parse_trace_mode_cli(s: &str) -> Result<String, String> {
+	match s {
+		"none" | "outliers" | "static" => Ok(s.to_string()),
+		other => Err(format!("expected one of: none, outliers, static (got '{other}')")),
+	}
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,7 +127,27 @@ async fn main() -> Result<(), ()> {
 			.filter(|s| !s.is_empty())
 			.or_else(|| config.telemetry.otlp_endpoint.clone()),
 		service_name: config.telemetry.service_name.clone(),
-		trace_sample_rate: config.telemetry.trace_sample_rate.unwrap_or(0.01),
+		// Trace mode resolution priority:
+		//   1) --trace-mode CLI (with --trace-sample-rate for static)
+		//   2) [telemetry] trace_mode in config (with trace_sample_rate)
+		//   3) Default: bench → Static(1.0) (full fidelity), else Outliers
+		trace_mode: {
+			let mode_str = args.trace_mode.clone().or_else(|| config.telemetry.trace_mode.clone());
+			let cli_rate = args.trace_sample_rate.or(config.telemetry.trace_sample_rate);
+			match mode_str.as_deref() {
+				Some("none") => telemetry::TraceMode::None,
+				Some("outliers") => telemetry::TraceMode::Outliers,
+				Some("static") => telemetry::TraceMode::Static(cli_rate.unwrap_or(0.05)),
+				Some(_) | None => {
+					if matches!(args.command, Some(Command::Bench(_))) {
+						// Bench is short and we want everything.
+						telemetry::TraceMode::Static(1.0)
+					} else {
+						telemetry::TraceMode::Outliers
+					}
+				}
+			}
+		},
 		metric_export_interval: config
 			.telemetry
 			.metric_export_interval_ms
@@ -150,6 +187,10 @@ async fn main() -> Result<(), ()> {
 	match args.command {
 		Some(Command::Bench(bench_args)) => {
 			let result = bench::run(config, bench_args, shutdown.clone()).await;
+			// Drain pending OTel exports synchronously before exit. Bench
+			// runs are short enough that the BatchSpanProcessor's scheduled
+			// flush can lose the trailing window otherwise.
+			_telemetry.force_flush();
 			let _ = shutdown.trigger_shutdown(result.map(|_| 0).unwrap_or(1));
 			let exit_code = shutdown.wait_shutdown_complete().await;
 			std::process::exit(exit_code);

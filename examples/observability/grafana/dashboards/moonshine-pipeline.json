@@ -12,7 +12,7 @@
         "name": "codec",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "query": "label_values(moonshine_total_latency_us_count, codec)",
+        "query": "label_values(moonshine_total_latency_microseconds_count, codec)",
         "includeAll": true,
         "multi": true,
         "current": { "text": "All", "value": "$__all" }
@@ -28,22 +28,22 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(moonshine_total_latency_us_bucket{codec=~\"$codec\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(moonshine_total_latency_us_bucket{codec=~\"$codec\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(moonshine_total_latency_us_bucket{codec=~\"$codec\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
           "legendFormat": "p99",
           "refId": "C"
         },
         {
-          "expr": "max_over_time(histogram_quantile(0.999, sum by (le) (rate(moonshine_total_latency_us_bucket{codec=~\"$codec\"}[1m])))[5m:])",
+          "expr": "max_over_time(histogram_quantile(0.999, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))[5m:])",
           "legendFormat": "p99.9 (5m max)",
           "refId": "D"
         }
@@ -63,7 +63,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (stage, le) (rate(moonshine_stage_latency_us_bucket{codec=~\"$codec\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (stage, le) (rate(moonshine_stage_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
           "legendFormat": "{{stage}}",
           "refId": "A"
         }
@@ -107,8 +107,8 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "moonshine_gpu_sclk_mhz", "legendFormat": "sclk MHz", "refId": "A" },
-        { "expr": "moonshine_gpu_busy_ratio * 100", "legendFormat": "busy % (right axis)", "refId": "B" }
+        { "expr": "moonshine_gpu_sclk_mhz_MHz", "legendFormat": "sclk MHz", "refId": "A" },
+        { "expr": "moonshine_gpu_busy_percent", "legendFormat": "busy % (right axis)", "refId": "B" }
       ]
     },
     {

@@ -64,14 +64,27 @@ pub struct Config {
 
 /// TOML mirror of `crate::telemetry::TelemetryConfig`. Kept separate so
 /// the telemetry module can stay free of serde / TOML knowledge.
+///
+/// Example:
+///
+/// ```toml
+/// [telemetry]
+/// otlp_endpoint = "http://localhost:4317"
+/// trace_mode = "outliers"           # one of: "none", "outliers", "static"
+/// trace_sample_rate = 0.05          # only used when trace_mode = "static"
+/// metric_export_interval_ms = 10000
+/// ```
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TelemetryConfigToml {
 	#[serde(default)]
 	pub otlp_endpoint: Option<String>,
 	#[serde(default)]
 	pub service_name: Option<String>,
-	/// Trace sampling rate for normal frames (0.0–1.0). Spike frames are
-	/// always sampled regardless of this value.
+	/// `"none"`, `"outliers"`, or `"static"`. Default: `"outliers"`.
+	#[serde(default)]
+	pub trace_mode: Option<String>,
+	/// Trace sampling rate (0.0–1.0). Only consulted when
+	/// `trace_mode = "static"`.
 	#[serde(default)]
 	pub trace_sample_rate: Option<f64>,
 	/// Metric export interval in milliseconds.

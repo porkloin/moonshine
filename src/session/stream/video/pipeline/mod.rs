@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
-use crate::telemetry::{PipelineLatency, PipelineMetrics};
+use crate::telemetry::{FrameAttrs, PipelineLatency, PipelineMetrics, TraceMode};
 use opentelemetry::global as otel_global;
 
 use super::packetizer::Packetizer;
@@ -30,34 +30,29 @@ use pixelforge::{
 };
 
 /// Spawn a 1-Hz GPU stat sampler that writes into the telemetry gauges.
-/// Lives on a tokio task; ends when the session shutdown manager fires.
-/// No-op when no AMD card is found under `/sys/class/drm`.
+/// Plain `std::thread` (no tokio dependency) so it works from the
+/// pipeline's own non-tokio thread context. Ends when the
+/// `ShutdownManager`'s shutdown signal fires. No-op when no AMD card is
+/// found under `/sys/class/drm`.
 fn spawn_gpu_sampler(metrics: Arc<PipelineMetrics>, shutdown: ShutdownManager<SessionShutdownReason>) {
 	let Some(card_root) = crate::gpu_stats::auto_detect_amd_card() else {
 		tracing::debug!("GPU stat sampler: no AMD card found, telemetry gauges will stay at 0");
 		return;
 	};
 	let paths = crate::gpu_stats::CardPaths::from_card(&card_root);
-	tokio::spawn(async move {
+	let _ = std::thread::Builder::new().name("gpu-stat-sampler".to_string()).spawn(move || {
 		let _delay = shutdown.delay_shutdown_token();
-		let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-		let mut on_shutdown = std::pin::pin!(shutdown.wait_shutdown_triggered());
-		loop {
-			tokio::select! {
-				_ = interval.tick() => {
-					if let Some(mhz) = crate::gpu_stats::read_active_sclk_mhz(&paths.sclk) {
-						metrics.gpu_sclk_mhz.record(mhz as u64, &[]);
-					}
-					if let Some(pct) = crate::gpu_stats::read_busy_percent(&paths.busy) {
-						metrics.gpu_busy_pct.record(pct as u64, &[]);
-					}
-					if let Some(bytes) = crate::gpu_stats::read_vram_used_bytes(&paths.vram) {
-						metrics.vram_used_bytes.record(bytes, &[]);
-					}
-				}
-				_ = on_shutdown.as_mut() => break,
+		while !shutdown.is_shutdown_triggered() {
+			if let Some(mhz) = crate::gpu_stats::read_active_sclk_mhz(&paths.sclk) {
+				metrics.gpu_sclk_mhz.record(mhz as u64, &[]);
 			}
+			if let Some(pct) = crate::gpu_stats::read_busy_percent(&paths.busy) {
+				metrics.gpu_busy_pct.record(pct as u64, &[]);
+			}
+			if let Some(bytes) = crate::gpu_stats::read_vram_used_bytes(&paths.vram) {
+				metrics.vram_used_bytes.record(bytes, &[]);
+			}
+			std::thread::sleep(std::time::Duration::from_secs(1));
 		}
 	});
 }
@@ -190,6 +185,7 @@ impl VideoPipeline {
 		// no-op provider and instrument creation is essentially free —
 		// recording into them just drops on the floor.
 		let metrics = Some(Arc::new(PipelineMetrics::new(&otel_global::meter("moonshine.pipeline"))));
+		let trace_mode = crate::telemetry::trace_mode();
 
 		let inner = VideoPipelineInner {
 			width,
@@ -207,6 +203,7 @@ impl VideoPipeline {
 			log_frame_spikes,
 			stats_tx,
 			metrics,
+			trace_mode,
 		};
 
 		std::thread::Builder::new()
@@ -243,6 +240,10 @@ struct VideoPipelineInner {
 	/// OTel metrics, resolved from the global meter at construction.
 	/// `None` is the path that runs in tests / when no meter is registered.
 	metrics: Option<Arc<PipelineMetrics>>,
+	/// Snapshot of `crate::telemetry::TraceMode` for the running session.
+	/// Read fresh from the global telemetry config at construction so we
+	/// don't pay an Arc deref per frame.
+	trace_mode: TraceMode,
 	/// Optional sink for per-frame latency samples. Used by the bench harness;
 	/// `None` in normal sessions to avoid extra work on the hot path.
 	stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
@@ -404,6 +405,14 @@ impl VideoPipelineInner {
 		// Color converter will be initialized on first frame.
 		let mut color_converter: Option<ColorConverter> = None;
 
+		// Pre-built attribute set for the metrics hot path. Codec + hdr
+		// don't change across a session, so we build the KeyValue arrays
+		// once and borrow them on every frame. `None` when telemetry is
+		// disabled — zero overhead when the global meter is the no-op.
+		let frame_attrs = self.metrics.as_ref().map(|_| {
+			FrameAttrs::new(codec_label(self.video_format), self.dynamic_range == VideoDynamicRange::Hdr)
+		});
+
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
 		let mut last_frame_time = std::time::Instant::now();
@@ -483,30 +492,6 @@ impl VideoPipelineInner {
 
 			if let Some(frame) = received_frame {
 				let t1_received = std::time::Instant::now();
-
-				// Per-frame OTel root span. Stage durations are filled in
-				// as fields at end-of-frame so we don't pay for nested
-				// span entry/exit on the hot path. `frame.encode` is the
-				// canonical span name; collectors / dashboards can group
-				// by `codec` and `hdr`.
-				let frame_span = tracing::info_span!(
-					"frame.encode",
-					codec = ?self.video_format,
-					hdr = self.dynamic_range == VideoDynamicRange::Hdr,
-					buffer_index = frame.buffer_index,
-					// Filled in at end-of-frame (Empty fields are recorded
-					// via span.record() once we know the values).
-					channel_wait_us = tracing::field::Empty,
-					import_us = tracing::field::Empty,
-					convert_us = tracing::field::Empty,
-					encode_us = tracing::field::Empty,
-					packetize_us = tracing::field::Empty,
-					send_us = tracing::field::Empty,
-					total_us = tracing::field::Empty,
-					encoded_bytes = tracing::field::Empty,
-					is_key_frame = tracing::field::Empty,
-				);
-				let _frame_span_guard = frame_span.enter();
 
 				tracing::trace!(
 					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",
@@ -788,39 +773,69 @@ impl VideoPipelineInner {
 					is_key_frame,
 				};
 
-				// Fill the OTel span with stage durations + result.
-				let total_us = total.as_micros() as u64;
-				let convert_us = convert_dur.as_micros() as u64;
-				let encode_us = encode_dur.as_micros() as u64;
-				frame_span.record("channel_wait_us", channel_wait.as_micros() as u64);
-				frame_span.record("import_us", import_dur.as_micros() as u64);
-				frame_span.record("convert_us", convert_us);
-				frame_span.record("encode_us", encode_us);
-				frame_span.record("packetize_us", packetize_dur.as_micros() as u64);
-				frame_span.record("send_us", send_dur.as_micros() as u64);
-				frame_span.record("total_us", total_us);
-				frame_span.record("encoded_bytes", encoded_bytes as u64);
-				frame_span.record("is_key_frame", is_key_frame);
-
 				// Record into OTel metrics (counters/histograms/gauges).
-				// When no OTLP endpoint is configured the global meter is
-				// a no-op provider — these calls drop on the floor.
-				if let Some(metrics) = &self.metrics {
-					metrics.record_frame(
-						codec_label(self.video_format),
-						self.dynamic_range == VideoDynamicRange::Hdr,
-						&PipelineLatency {
-							channel_wait_us: channel_wait.as_micros() as u64,
-							import_us: import_dur.as_micros() as u64,
-							convert_us,
-							encode_us,
-							packetize_us: packetize_dur.as_micros() as u64,
-							send_us: send_dur.as_micros() as u64,
-							total_us,
-							encoded_bytes,
-							frame_budget_us: frame_interval_us as u64,
-						},
+				// Cheap by design — pre-built FrameAttrs, lock-free
+				// instruments, no allocations.
+				let total_us = total.as_micros() as u64;
+				let frame_budget_us = frame_interval_us as u64;
+				let pipeline_lat = PipelineLatency {
+					channel_wait_us: channel_wait.as_micros() as u64,
+					import_us: import_dur.as_micros() as u64,
+					convert_us: convert_dur.as_micros() as u64,
+					encode_us: encode_dur.as_micros() as u64,
+					packetize_us: packetize_dur.as_micros() as u64,
+					send_us: send_dur.as_micros() as u64,
+					total_us,
+					encoded_bytes,
+					frame_budget_us,
+				};
+				if let (Some(metrics), Some(attrs)) = (&self.metrics, &frame_attrs) {
+					metrics.record_frame(attrs, &pipeline_lat);
+				}
+
+				// Trace emission decision based on the configured mode:
+				//   None      — no span at all
+				//   Static(r) — emit on `r` fraction of frames, decided
+				//                client-side so we don't pay span-creation
+				//                cost on the rejected frames. Hash-based
+				//                so the keep set is deterministic per
+				//                buffer_index — easier to reason about
+				//                than a stateful counter.
+				//   Outliers  — span only when the frame spiked
+				let is_spike = total_us > frame_budget_us;
+				let emit_span = match self.trace_mode {
+					TraceMode::None => false,
+					TraceMode::Static(r) if r >= 1.0 => true,
+					TraceMode::Static(r) if r <= 0.0 => false,
+					TraceMode::Static(r) => {
+						// Cheap deterministic 1-bit decision based on
+						// buffer_index × frame_count. No allocations,
+						// no global state.
+						let h = (frame.buffer_index as u64).wrapping_mul(0x9E3779B97F4A7C15);
+						(h as f64 / u64::MAX as f64) < r
+					}
+					TraceMode::Outliers => is_spike,
+				};
+				if emit_span {
+					let span = tracing::info_span!(
+						"frame.encode",
+						codec = codec_label(self.video_format),
+						hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+						buffer_index = frame.buffer_index,
+						channel_wait_us = pipeline_lat.channel_wait_us,
+						import_us = pipeline_lat.import_us,
+						convert_us = pipeline_lat.convert_us,
+						encode_us = pipeline_lat.encode_us,
+						packetize_us = pipeline_lat.packetize_us,
+						send_us = pipeline_lat.send_us,
+						total_us,
+						encoded_bytes,
+						is_key_frame,
+						spike = is_spike,
 					);
+					// Enter+exit immediately; we don't have nested work
+					// to wrap, only metadata to ship.
+					let _g = span.enter();
 				}
 
 				if let Some(tx) = self.stats_tx.as_ref() {
