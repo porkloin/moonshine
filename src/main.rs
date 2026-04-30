@@ -56,20 +56,10 @@ enum Command {
 async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
-	// Telemetry init has to happen before any tracing call (it owns the
-	// global subscriber). When OTLP is unset, this still installs a stdout
-	// `tracing_subscriber` layer so logs work — telemetry is purely
-	// additive. We pull the OTLP endpoint from the loaded config below
-	// (after this stub init) by re-reading it from the env / CLI.
-	//
-	// SKETCH NOTE: in the final shape, we'd load config FIRST (without
-	// using `tracing!` in the load path), then init telemetry once with
-	// the resolved settings. For now the bootstrap subscriber lets
-	// `tracing::warn!` work during config-load failure.
-	let _bootstrap_logger = tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
-		.with(EnvFilter::from_default_env())
-		.set_default();
+	// Config load runs before telemetry init so `[telemetry]` settings
+	// take effect. tracing! calls during config load won't appear because
+	// no subscriber is installed yet — pre-init failures fall back to
+	// eprintln! below.
 
 	// Ensure rustls has a single crypto provider selected at process start.
 	// When multiple crypto backends (ring, aws-lc-rs) are present the crate
@@ -113,10 +103,8 @@ async fn main() -> Result<(), ()> {
 		shellexpand::full(&private_key_path).map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
 	config.webserver.private_key = private_key_path.to_string().into();
 
-	// Now that config is loaded, drop the bootstrap subscriber and install
-	// the real one (which optionally exports OTel). CLI override wins over
-	// config; empty-string CLI override disables.
-	drop(_bootstrap_logger);
+	// Install the real subscriber + (optional) OTel pipelines. CLI override
+	// wins over config; empty-string CLI override disables.
 	let telemetry_cfg = telemetry::TelemetryConfig {
 		otlp_endpoint: args
 			.otlp_endpoint

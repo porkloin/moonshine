@@ -15,6 +15,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
+use crate::telemetry::{PipelineLatency, PipelineMetrics};
+use opentelemetry::global as otel_global;
 
 use super::packetizer::Packetizer;
 use super::shard_batch::ShardBatch;
@@ -26,6 +28,17 @@ use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacket, Encoder,
 	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
+
+/// Label string for OTel metric attributes. Keeps cardinality low (one
+/// of three known values) so collectors don't have to deal with arbitrary
+/// strings.
+fn codec_label(format: VideoFormat) -> &'static str {
+	match format {
+		VideoFormat::H264 => "h264",
+		VideoFormat::Hevc => "hevc",
+		VideoFormat::Av1 => "av1",
+	}
+}
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
@@ -139,6 +152,12 @@ impl VideoPipeline {
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
+		// Resolve metrics instruments from the global meter. When telemetry
+		// init didn't run with an OTLP endpoint, the global meter is a
+		// no-op provider and instrument creation is essentially free —
+		// recording into them just drops on the floor.
+		let metrics = Some(Arc::new(PipelineMetrics::new(&otel_global::meter("moonshine.pipeline"))));
+
 		let inner = VideoPipelineInner {
 			width,
 			height,
@@ -154,6 +173,7 @@ impl VideoPipeline {
 			encryption_key,
 			log_frame_spikes,
 			stats_tx,
+			metrics,
 		};
 
 		std::thread::Builder::new()
@@ -187,6 +207,9 @@ struct VideoPipelineInner {
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
 	log_frame_spikes: bool,
+	/// OTel metrics, resolved from the global meter at construction.
+	/// `None` is the path that runs in tests / when no meter is registered.
+	metrics: Option<Arc<PipelineMetrics>>,
 	/// Optional sink for per-frame latency samples. Used by the bench harness;
 	/// `None` in normal sessions to avoid extra work on the hot path.
 	stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
@@ -418,35 +441,29 @@ impl VideoPipelineInner {
 			if let Some(frame) = received_frame {
 				let t1_received = std::time::Instant::now();
 
-				// SKETCH NOTE — OTel integration point:
-				//
-				// Wrap this whole frame in a root span so the OTel pipeline
-				// gets a `frame.encode` trace per frame. The existing per-stage
-				// `Instant::now()` deltas would each be wrapped in a child
-				// span (`frame.convert`, `frame.encode`, etc.) so collectors
-				// can show the full breakdown without us hand-rolling
-				// histograms.
-				//
-				// let _frame_span = tracing::info_span!(
-				//     "frame.encode",
-				//     codec = ?codec,
-				//     hdr = self.dynamic_range == VideoDynamicRange::Hdr,
-				//     buffer_index = frame.buffer_index,
-				// ).entered();
-				//
-				// Each stage wrapped:
-				//   { let _s = tracing::info_span!("frame.convert").entered();
-				//     blitter.blit(...) ?; }
-				//
-				// Then at end of loop, after computing the LatencySample:
-				//   if let Some(metrics) = &self.metrics {
-				//       metrics.record_frame(codec_str, hdr, &PipelineLatency { … });
-				//   }
-				//
-				// `self.metrics: Option<Arc<PipelineMetrics>>` — `None` when
-				// telemetry is disabled, instruments are lock-free counters
-				// when enabled. Resolved once at pipeline construction from
-				// `opentelemetry::global::meter("moonshine.pipeline")`.
+				// Per-frame OTel root span. Stage durations are filled in
+				// as fields at end-of-frame so we don't pay for nested
+				// span entry/exit on the hot path. `frame.encode` is the
+				// canonical span name; collectors / dashboards can group
+				// by `codec` and `hdr`.
+				let frame_span = tracing::info_span!(
+					"frame.encode",
+					codec = ?self.video_format,
+					hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+					buffer_index = frame.buffer_index,
+					// Filled in at end-of-frame (Empty fields are recorded
+					// via span.record() once we know the values).
+					channel_wait_us = tracing::field::Empty,
+					import_us = tracing::field::Empty,
+					convert_us = tracing::field::Empty,
+					encode_us = tracing::field::Empty,
+					packetize_us = tracing::field::Empty,
+					send_us = tracing::field::Empty,
+					total_us = tracing::field::Empty,
+					encoded_bytes = tracing::field::Empty,
+					is_key_frame = tracing::field::Empty,
+				);
+				let _frame_span_guard = frame_span.enter();
 
 				tracing::trace!(
 					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",
@@ -728,6 +745,41 @@ impl VideoPipelineInner {
 					is_key_frame,
 				};
 
+				// Fill the OTel span with stage durations + result.
+				let total_us = total.as_micros() as u64;
+				let convert_us = convert_dur.as_micros() as u64;
+				let encode_us = encode_dur.as_micros() as u64;
+				frame_span.record("channel_wait_us", channel_wait.as_micros() as u64);
+				frame_span.record("import_us", import_dur.as_micros() as u64);
+				frame_span.record("convert_us", convert_us);
+				frame_span.record("encode_us", encode_us);
+				frame_span.record("packetize_us", packetize_dur.as_micros() as u64);
+				frame_span.record("send_us", send_dur.as_micros() as u64);
+				frame_span.record("total_us", total_us);
+				frame_span.record("encoded_bytes", encoded_bytes as u64);
+				frame_span.record("is_key_frame", is_key_frame);
+
+				// Record into OTel metrics (counters/histograms/gauges).
+				// When no OTLP endpoint is configured the global meter is
+				// a no-op provider — these calls drop on the floor.
+				if let Some(metrics) = &self.metrics {
+					metrics.record_frame(
+						codec_label(self.video_format),
+						self.dynamic_range == VideoDynamicRange::Hdr,
+						&PipelineLatency {
+							channel_wait_us: channel_wait.as_micros() as u64,
+							import_us: import_dur.as_micros() as u64,
+							convert_us,
+							encode_us,
+							packetize_us: packetize_dur.as_micros() as u64,
+							send_us: send_dur.as_micros() as u64,
+							total_us,
+							encoded_bytes,
+							frame_budget_us: frame_interval_us as u64,
+						},
+					);
+				}
+
 				if let Some(tx) = self.stats_tx.as_ref() {
 					// Bench-mode sink. If the receiver is gone we just stop trying.
 					let _ = tx.send(sample.clone());
@@ -740,6 +792,13 @@ impl VideoPipelineInner {
 					log_latency_summary(&latency_samples);
 					latency_samples.clear();
 					last_summary_time = std::time::Instant::now();
+
+					// Sample the dmabuf cache size into a gauge once per
+					// summary tick. Lets dashboards alert on unbounded
+					// growth (the leak that fix-dmabuf-leak addresses).
+					if let (Some(metrics), Some(importer)) = (&self.metrics, &dmabuf_importer) {
+						metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
+					}
 				}
 
 				if !pending_idr {
