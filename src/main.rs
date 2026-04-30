@@ -24,6 +24,7 @@ mod publisher;
 mod rtsp;
 mod session;
 mod state;
+mod telemetry;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -31,6 +32,13 @@ mod webserver;
 struct Args {
 	/// Path to configuration file.
 	config: PathBuf,
+
+	/// Override the OTLP exporter endpoint from the config (e.g.
+	/// `http://localhost:4317`). Useful for ad-hoc profiling without
+	/// editing config.toml. Empty string disables telemetry even if the
+	/// config enables it.
+	#[arg(long, global = true)]
+	otlp_endpoint: Option<String>,
 
 	#[command(subcommand)]
 	command: Option<Command>,
@@ -48,10 +56,20 @@ enum Command {
 async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
-	tracing_subscriber::registry()
+	// Telemetry init has to happen before any tracing call (it owns the
+	// global subscriber). When OTLP is unset, this still installs a stdout
+	// `tracing_subscriber` layer so logs work — telemetry is purely
+	// additive. We pull the OTLP endpoint from the loaded config below
+	// (after this stub init) by re-reading it from the env / CLI.
+	//
+	// SKETCH NOTE: in the final shape, we'd load config FIRST (without
+	// using `tracing!` in the load path), then init telemetry once with
+	// the resolved settings. For now the bootstrap subscriber lets
+	// `tracing::warn!` work during config-load failure.
+	let _bootstrap_logger = tracing_subscriber::registry()
 		.with(tracing_subscriber::fmt::layer())
 		.with(EnvFilter::from_default_env())
-		.init();
+		.set_default();
 
 	// Ensure rustls has a single crypto provider selected at process start.
 	// When multiple crypto backends (ring, aws-lc-rs) are present the crate
@@ -94,6 +112,26 @@ async fn main() -> Result<(), ()> {
 	let private_key_path =
 		shellexpand::full(&private_key_path).map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
 	config.webserver.private_key = private_key_path.to_string().into();
+
+	// Now that config is loaded, drop the bootstrap subscriber and install
+	// the real one (which optionally exports OTel). CLI override wins over
+	// config; empty-string CLI override disables.
+	drop(_bootstrap_logger);
+	let telemetry_cfg = telemetry::TelemetryConfig {
+		otlp_endpoint: args
+			.otlp_endpoint
+			.clone()
+			.filter(|s| !s.is_empty())
+			.or_else(|| config.telemetry.otlp_endpoint.clone()),
+		service_name: config.telemetry.service_name.clone(),
+		trace_sample_rate: config.telemetry.trace_sample_rate.unwrap_or(0.01),
+		metric_export_interval: config
+			.telemetry
+			.metric_export_interval_ms
+			.map(std::time::Duration::from_millis)
+			.unwrap_or(std::time::Duration::from_secs(10)),
+	};
+	let _telemetry = telemetry::init(&telemetry_cfg).map_err(|e| tracing::error!("telemetry init: {e}"))?;
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 

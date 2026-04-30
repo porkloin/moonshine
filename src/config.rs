@@ -51,6 +51,32 @@ pub struct Config {
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
+
+	/// Optional OpenTelemetry exporter configuration. When `otlp_endpoint`
+	/// is unset (default), telemetry is fully disabled — no spans, no
+	/// metrics, no overhead. When set, moonshine ships per-frame traces
+	/// and aggregated histograms/counters/gauges to the configured OTLP
+	/// gRPC endpoint, which the user runs (Tempo, Jaeger, SigNoz, an
+	/// otelcol passthrough, whatever).
+	#[serde(default)]
+	pub telemetry: TelemetryConfigToml,
+}
+
+/// TOML mirror of `crate::telemetry::TelemetryConfig`. Kept separate so
+/// the telemetry module can stay free of serde / TOML knowledge.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TelemetryConfigToml {
+	#[serde(default)]
+	pub otlp_endpoint: Option<String>,
+	#[serde(default)]
+	pub service_name: Option<String>,
+	/// Trace sampling rate for normal frames (0.0–1.0). Spike frames are
+	/// always sampled regardless of this value.
+	#[serde(default)]
+	pub trace_sample_rate: Option<f64>,
+	/// Metric export interval in milliseconds.
+	#[serde(default)]
+	pub metric_export_interval_ms: Option<u64>,
 }
 
 impl Config {
@@ -87,6 +113,7 @@ impl Default for Config {
 			})],
 			gpu: None,
 			hdr_support: true,
+			telemetry: TelemetryConfigToml::default(),
 			stream_timeout: 60,
 		}
 	}

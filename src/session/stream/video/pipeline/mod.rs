@@ -418,6 +418,36 @@ impl VideoPipelineInner {
 			if let Some(frame) = received_frame {
 				let t1_received = std::time::Instant::now();
 
+				// SKETCH NOTE — OTel integration point:
+				//
+				// Wrap this whole frame in a root span so the OTel pipeline
+				// gets a `frame.encode` trace per frame. The existing per-stage
+				// `Instant::now()` deltas would each be wrapped in a child
+				// span (`frame.convert`, `frame.encode`, etc.) so collectors
+				// can show the full breakdown without us hand-rolling
+				// histograms.
+				//
+				// let _frame_span = tracing::info_span!(
+				//     "frame.encode",
+				//     codec = ?codec,
+				//     hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+				//     buffer_index = frame.buffer_index,
+				// ).entered();
+				//
+				// Each stage wrapped:
+				//   { let _s = tracing::info_span!("frame.convert").entered();
+				//     blitter.blit(...) ?; }
+				//
+				// Then at end of loop, after computing the LatencySample:
+				//   if let Some(metrics) = &self.metrics {
+				//       metrics.record_frame(codec_str, hdr, &PipelineLatency { … });
+				//   }
+				//
+				// `self.metrics: Option<Arc<PipelineMetrics>>` — `None` when
+				// telemetry is disabled, instruments are lock-free counters
+				// when enabled. Resolved once at pipeline construction from
+				// `opentelemetry::global::meter("moonshine.pipeline")`.
+
 				tracing::trace!(
 					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",
 					frame.format,
