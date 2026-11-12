@@ -117,6 +117,15 @@ fn is_hdr(encoder: &Encoder) -> bool {
 	matches!(encoder.config().color, StreamColor::Hdr10 { .. })
 }
 
+/// Whether an invalidation request for the lost display orders `first..=last`
+/// repeats the last one answered, `answered = (its first lost display order,
+/// the display order of the frame answering it)`. The client reports every frame
+/// it drops until that answer reaches it; a request that reaches the answering
+/// frame means the answer was lost too.
+fn covered_by(answered: Option<(u64, u64)>, first: u64, last: u64) -> bool {
+	answered.is_some_and(|(answered_first, answer)| first >= answered_first && last < answer)
+}
+
 pub(crate) struct VideoPipeline {}
 
 /// A single frame's latency breakdown for periodic summary reporting.
@@ -843,6 +852,8 @@ impl VideoPipelineInner {
 		// worst over-invalidates into a (safe) IDR.
 		let mut submitted_count: u64 = 0;
 		let mut frame_number_base: u64 = 0;
+		// The last invalidation answered, for `covered_by`.
+		let mut last_invalidation: Option<(u64, u64)> = None;
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
@@ -879,6 +890,7 @@ impl VideoPipelineInner {
 				// The next submitted frame becomes the consumer's frame 1 of the
 				// new epoch; anchor the invalidation index mapping to it.
 				frame_number_base = submitted_count;
+				last_invalidation = None;
 				encoder.request_idr();
 				pending_idr = true;
 			}
@@ -906,12 +918,20 @@ impl VideoPipelineInner {
 			// falls back to an IDR when no reference survives).
 			loop {
 				match invalidate_request_rx.try_recv() {
-					Ok((first, _last)) => {
+					Ok((first, last)) => {
 						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
+						let last_display_order = frame_number_base + (last.max(1) as u64 - 1);
+						if covered_by(last_invalidation, first_display_order, last_display_order) {
+							tracing::trace!(
+								"Skipping reference frame invalidation from client frame {first}, already answered"
+							);
+							continue;
+						}
 						tracing::debug!(
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						last_invalidation = Some((first_display_order, submitted_count));
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
@@ -1218,6 +1238,7 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
+	use super::covered_by;
 	use super::drm_fourcc_to_input;
 	use ash::vk;
 	use pixelforge::RgbFormat;
@@ -1231,6 +1252,19 @@ mod tests {
 	const XBGR2101010: u32 = 0x30334258; // "XB30"
 	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
 	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
+
+	#[test]
+	fn covered_by_skips_only_repeats_of_the_answered_loss() {
+		// The loss from display order 10 was answered by the frame at 20.
+		let answered = Some((10, 20));
+		assert!(covered_by(answered, 10, 10));
+		assert!(covered_by(answered, 12, 19));
+		// The answer itself was lost.
+		assert!(!covered_by(answered, 12, 20));
+		// Loss from before the answered one.
+		assert!(!covered_by(answered, 8, 9));
+		assert!(!covered_by(None, 1, 2));
+	}
 
 	#[test]
 	fn drm_fourcc_abgr_xbgr_8bit_maps_to_rgba() {

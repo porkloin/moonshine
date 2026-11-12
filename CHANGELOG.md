@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Re-encode the last frame, not the one before it, for an IDR request while no new frame arrives.
+- Answer a frame loss with one IDR, not one for each time the client reports the loss again before that IDR reaches it.
 
 ## [v0.16.1] - 13-09-2026
 
